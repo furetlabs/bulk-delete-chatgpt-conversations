@@ -1,3 +1,5 @@
+> **Documentation historique de l’amont :** le stockage dans un fichier et le harness décrits ci-dessous ne correspondent plus à cette branche. Voir [DEVELOPPEMENT.md](DEVELOPPEMENT.md) avant toute utilisation. Les actions réelles sont désactivées.
+
 # Authentication
 
 `chatgpt-bulk` now uses a login-first flow.

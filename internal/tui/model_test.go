@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -267,4 +268,38 @@ type errTestActionFailed struct{}
 
 func (errTestActionFailed) Error() string {
 	return "action failed"
+}
+
+func TestFilterChangeClearsHiddenSelection(t *testing.T) {
+	m := Model{phase: phaseSelect, filtering: true, selected: map[string]struct{}{"a": {}}, conversations: []chatgpt.Conversation{{ID: "a", Title: "alpha"}}}
+	next, _ := m.updateSelection(tea.KeyPressMsg(tea.Key{Text: "b", Code: 'b'}))
+	if len(next.(Model).selected) != 0 {
+		t.Fatal("selection remains after filter change")
+	}
+}
+
+func TestRefreshCannotInterruptRunningBatch(t *testing.T) {
+	m := Model{phase: phaseRunning, selected: map[string]struct{}{"a": {}}, conversations: []chatgpt.Conversation{{ID: "a", Title: "A"}}}
+	next, _ := m.Update(loadResultMsg{refresh: true, conversations: []chatgpt.Conversation{{ID: "b", Title: "B"}}})
+	got := next.(Model)
+	if got.phase != phaseRunning || got.conversations[0].ID != "a" {
+		t.Fatal("refresh interrupted batch")
+	}
+}
+
+func TestSelectAllUsesVisibleIDsNotCounts(t *testing.T) {
+	m := Model{phase: phaseSelect, selected: map[string]struct{}{"a": {}}, conversations: []chatgpt.Conversation{{ID: "a", Title: "A"}, {ID: "b", Title: "B"}}, filtered: []chatgpt.Conversation{{ID: "b", Title: "B"}}}
+	next, _ := m.updateSelection(tea.KeyPressMsg(tea.Key{Text: "a", Code: 'a'}))
+	if _, ok := next.(Model).selected["b"]; !ok {
+		t.Fatal("visible conversation not selected")
+	}
+}
+
+func TestCancelledBatchStopsBeforeNextConversation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	results := runBatch(ctx, []chatgpt.Conversation{{ID: "a"}, {ID: "b"}}, func(ctx context.Context, id string) error { calls++; cancel(); return nil })
+	if calls != 1 || len(results) != 1 {
+		t.Fatalf("calls=%d results=%d", calls, len(results))
+	}
 }

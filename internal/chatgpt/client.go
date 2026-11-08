@@ -47,6 +47,7 @@ type Conversation struct {
 
 type conversationList struct {
 	Items []Conversation `json:"items"`
+	Total *int           `json:"total"`
 }
 
 type sessionResponse struct {
@@ -57,19 +58,22 @@ type sessionResponse struct {
 }
 
 type Client struct {
-	debug        bool
-	headless     bool
-	chromePath   string
-	sessionToken string
-	csrfToken    string
-	accessToken  string
-	userEmail    string
-	authSource   AuthSource
-	status       string
-	httpClient   *http.Client
-	debugPort    int
-	allowLogin   bool
-	saveAuth     func(AuthState) error
+	debug             bool
+	headless          bool
+	chromePath        string
+	sessionToken      string
+	csrfToken         string
+	accessToken       string
+	userEmail         string
+	authSource        AuthSource
+	status            string
+	httpClient        *http.Client
+	debugPort         int
+	allowLogin        bool
+	allowMutations    bool
+	inventoryComplete bool
+	inventoryIDs      map[string]struct{}
+	saveAuth          func(AuthState) error
 
 	allocCtx    context.Context
 	allocCancel context.CancelFunc
@@ -183,6 +187,8 @@ func (c *Client) Logs() []string {
 func (c *Client) ListConversations(ctx context.Context, pageSize int) ([]Conversation, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.inventoryComplete = false
+	c.inventoryIDs = nil
 
 	if err := c.ensureReady(ctx); err != nil {
 		return nil, err
@@ -199,6 +205,8 @@ func (c *Client) ListConversations(ctx context.Context, pageSize int) ([]Convers
 
 	var (
 		offset        int
+		expectedTotal = -1
+		seen          = make(map[string]struct{})
 		conversations []Conversation
 	)
 
@@ -218,12 +226,35 @@ func (c *Client) ListConversations(ctx context.Context, pageSize int) ([]Convers
 		if err := json.Unmarshal(respBody, &page); err != nil {
 			return nil, fmt.Errorf("decode conversations response: %w", err)
 		}
-		if len(page.Items) == 0 {
+		if page.Items == nil || page.Total == nil || *page.Total < 0 || *page.Total > 1000000 {
+			return nil, errors.New("conversation response missing valid items or total")
+		}
+		if expectedTotal == -1 {
+			expectedTotal = *page.Total
+		} else if expectedTotal != *page.Total {
+			return nil, errors.New("conversation total changed during pagination")
+		}
+		if len(page.Items) > pageSize || offset+len(page.Items) > expectedTotal {
+			return nil, errors.New("invalid conversation page size")
+		}
+		for _, item := range page.Items {
+			id := strings.ToLower(item.ID)
+			if !conversationIDPattern.MatchString(id) {
+				return nil, errors.New("conversation has an invalid identifier")
+			}
+			if _, ok := seen[id]; ok {
+				return nil, errors.New("duplicate conversation in pagination")
+			}
+			seen[id] = struct{}{}
+		}
+		conversations = append(conversations, page.Items...)
+		offset += len(page.Items)
+		if offset == expectedTotal {
 			break
 		}
-
-		conversations = append(conversations, page.Items...)
-		offset += pageSize
+		if len(page.Items) == 0 {
+			return nil, errors.New("conversation inventory is incomplete")
+		}
 	}
 
 	cache.Conversations = conversations
@@ -232,51 +263,118 @@ func (c *Client) ListConversations(ctx context.Context, pageSize int) ([]Convers
 		return nil, err
 	}
 
+	c.inventoryIDs = make(map[string]struct{}, len(cache.Conversations))
+	for _, conv := range cache.Conversations {
+		c.inventoryIDs[strings.ToLower(conv.ID)] = struct{}{}
+	}
+	c.inventoryComplete = true
 	return cache.Conversations, nil
 }
 
 func (c *Client) ArchiveConversation(ctx context.Context, id string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.allowMutations {
+		return errors.New("mutations disabled pending safety validation")
+	}
+	unlock, err := lockProtection(ctx)
+	if err != nil {
+		return fmt.Errorf("lock operation: %w", err)
+	}
+	defer unlock()
+	if !conversationIDPattern.MatchString(id) {
+		return errors.New("invalid conversation ID")
+	}
+	if err := verifyUnprotected(id); err != nil {
+		return err
+	}
+	if !c.inventoryComplete {
+		return errors.New("conversation inventory is incomplete")
+	}
+	if _, ok := c.inventoryIDs[strings.ToLower(id)]; !ok {
+		return errors.New("conversation not in inventory")
+	}
 
 	if err := c.ensureReady(ctx); err != nil {
 		return err
 	}
-
-	_, err := c.doBackendRequest(ctx, httpMethodPatch, backendAPIURL+"/conversation/"+id, map[string]any{"is_archived": true})
-	if err != nil {
-		if retryErr := c.retryAuth(ctx, err); retryErr != nil {
-			return retryErr
-		}
-		_, err = c.doBackendRequest(ctx, httpMethodPatch, backendAPIURL+"/conversation/"+id, map[string]any{"is_archived": true})
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if err != nil {
+	if err := verifyUnprotected(id); err != nil {
 		return err
 	}
 
-	return c.recordConversationVisibility(id, ConversationVisibilityArchived)
+	_, err = c.doBackendRequest(ctx, httpMethodPatch, backendAPIURL+"/conversation/"+id, map[string]any{"is_archived": true})
+	if err != nil {
+		c.inventoryComplete = false
+		return err
+	}
+	delete(c.inventoryIDs, strings.ToLower(id))
+	if err := c.recordConversationVisibility(id, ConversationVisibilityArchived); err != nil {
+		c.inventoryComplete = false
+		return fmt.Errorf("remote archive succeeded but cache update failed: %w", err)
+	}
+	return nil
 }
 
 func (c *Client) DeleteConversation(ctx context.Context, id string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.allowMutations {
+		return errors.New("mutations disabled pending safety validation")
+	}
+	unlock, err := lockProtection(ctx)
+	if err != nil {
+		return fmt.Errorf("lock protection: %w", err)
+	}
+	defer unlock()
+	if !conversationIDPattern.MatchString(id) {
+		return errors.New("invalid conversation ID")
+	}
+	if err := verifyUnprotected(id); err != nil {
+		return err
+	}
+	if !c.inventoryComplete {
+		return errors.New("conversation inventory is incomplete")
+	}
+	if _, ok := c.inventoryIDs[strings.ToLower(id)]; !ok {
+		return errors.New("conversation not in inventory")
+	}
 
 	if err := c.ensureReady(ctx); err != nil {
 		return err
 	}
-
-	_, err := c.doBackendRequest(ctx, httpMethodPatch, backendAPIURL+"/conversation/"+id, map[string]any{"is_visible": false})
-	if err != nil {
-		if retryErr := c.retryAuth(ctx, err); retryErr != nil {
-			return retryErr
-		}
-		_, err = c.doBackendRequest(ctx, httpMethodPatch, backendAPIURL+"/conversation/"+id, map[string]any{"is_visible": false})
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	if err != nil {
+	if err := verifyUnprotected(id); err != nil {
 		return err
 	}
 
-	return c.recordConversationVisibility(id, ConversationVisibilityDeleted)
+	_, err = c.doBackendRequest(ctx, httpMethodPatch, backendAPIURL+"/conversation/"+id, map[string]any{"is_visible": false})
+	if err != nil {
+		c.inventoryComplete = false
+		return err
+	}
+	delete(c.inventoryIDs, strings.ToLower(id))
+	if err := c.recordConversationVisibility(id, ConversationVisibilityDeleted); err != nil {
+		c.inventoryComplete = false
+		return fmt.Errorf("remote update succeeded but cache update failed: %w", err)
+	}
+	return nil
+}
+
+// verifyUnprotected must be called while holding the protection lock.
+func verifyUnprotected(id string) error {
+	protections, err := readProtected()
+	if err != nil {
+		return fmt.Errorf("verify protection: %w", err)
+	}
+	if protections[strings.ToLower(id)] {
+		return errors.New("conversation is protected")
+	}
+	return nil
 }
 
 func (c *Client) CachedConversations() ([]Conversation, error) {
@@ -305,7 +403,7 @@ func (c *Client) ensureReady(ctx context.Context) error {
 			return errors.New("no stored ChatGPT auth file is available; run `chatgpt-bulk login`")
 		}
 		c.setStatus("Launching Chrome window...")
-		if err := c.startBrowser(); err != nil {
+		if err := c.startBrowser(ctx); err != nil {
 			c.Close()
 			return fmt.Errorf("browser launch failed: %w", err)
 		}
@@ -324,7 +422,10 @@ func (c *Client) Authenticate(ctx context.Context) (AuthState, error) {
 	return c.currentAuthState(), nil
 }
 
-func (c *Client) startBrowser() error {
+func (c *Client) startBrowser(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	chromePath, err := resolveChromePath(c.chromePath)
 	if err != nil {
 		return err
@@ -348,7 +449,7 @@ func (c *Client) startBrowser() error {
 	args := []string{
 		"https://chatgpt.com/",
 		fmt.Sprintf("--remote-debugging-port=%d", debugPort),
-		"--remote-debugging-address=0.0.0.0",
+		"--remote-debugging-address=127.0.0.1",
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--disable-popup-blocking",
@@ -364,7 +465,7 @@ func (c *Client) startBrowser() error {
 	}
 
 	c.setStatus(fmt.Sprintf("Waiting for Chrome debugger on port %d...", debugPort))
-	wsURL, err := waitForDebuggerURL(context.Background(), debugPort, 60*time.Second)
+	wsURL, err := waitForDebuggerURL(ctx, debugPort, 60*time.Second)
 	if err != nil {
 		return fmt.Errorf("wait for chrome debugger: %w", err)
 	}
@@ -372,10 +473,12 @@ func (c *Client) startBrowser() error {
 	c.allocCtx, c.allocCancel = chromedp.NewRemoteAllocator(context.Background(), wsURL)
 	c.browserCtx, c.browserStop = chromedp.NewContext(c.allocCtx)
 
-	startCtx, cancel := context.WithTimeout(c.browserCtx, 90*time.Second)
+	browserCtx, stopBrowserCtx := c.browserCommandContext(ctx)
+	defer stopBrowserCtx()
+	startCtx, cancel := context.WithTimeout(browserCtx, 90*time.Second)
 	defer cancel()
 
-	c.debugf("chrome debugger ready: %s", wsURL)
+	c.debugf("chrome debugger ready")
 	c.debugf("enabling network domain")
 	c.setStatus("Chrome debugger connected. Initializing browser session...")
 	if err := chromedp.Run(startCtx, network.Enable()); err != nil {
@@ -416,18 +519,18 @@ func (c *Client) waitForAccessToken(ctx context.Context) error {
 		var session sessionResponse
 		resp, err := c.fetchJSON(deadlineCtx, httpMethodGet, sessionAPIURL, nil)
 		if err != nil {
-			c.debugf("session poll error: %v", err)
+			c.debugf("session poll error")
 			if errors.Is(err, context.Canceled) ||
 				strings.Contains(err.Error(), "context canceled") ||
 				strings.Contains(err.Error(), "No target with given id found") {
 				if reattachErr := c.reattachToLivePage(); reattachErr != nil {
-					c.debugf("reattach failed: %v", reattachErr)
+					c.debugf("reattach failed")
 				} else {
 					c.debugf("reattached to live page target")
 				}
 			}
 		} else {
-			c.debugf("session poll status=%d body=%s", resp.Status, truncate([]byte(resp.Text), 250))
+			c.debugf("session poll status=%d", resp.Status)
 		}
 		if err == nil && resp.Status == http.StatusOK {
 			if err := json.Unmarshal(resp.Body, &session); err != nil {
@@ -566,8 +669,9 @@ func (c *Client) initializeHTTPClient() error {
 	}
 
 	c.httpClient = &http.Client{
-		Jar:     jar,
-		Timeout: 30 * time.Second,
+		Jar:           jar,
+		Timeout:       30 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	return nil
 }
@@ -667,14 +771,17 @@ func (c *Client) captureAuthState(ctx context.Context, session sessionResponse) 
 
 func (c *Client) browserCommandContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	if c.browserCtx == nil {
-		return ctx, func() {}
+		return context.WithCancel(ctx)
 	}
-
+	var child context.Context
+	var cancel context.CancelFunc
 	if deadline, ok := ctx.Deadline(); ok {
-		return context.WithDeadline(c.browserCtx, deadline)
+		child, cancel = context.WithDeadline(c.browserCtx, deadline)
+	} else {
+		child, cancel = context.WithCancel(c.browserCtx)
 	}
-
-	return context.WithCancel(c.browserCtx)
+	stop := context.AfterFunc(ctx, cancel)
+	return child, func() { stop(); cancel() }
 }
 
 func readCookieValue(cookies []*network.Cookie, name string) string {
@@ -807,16 +914,20 @@ func (c *Client) doBackendRequest(ctx context.Context, method, url string, paylo
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	const maxResponseBytes = 8 << 20
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	c.debugf("backend request method=%s url=%s status=%d body=%s", method, url, resp.StatusCode, truncate(respBody, 300))
+	if len(respBody) > maxResponseBytes {
+		return nil, errors.New("backend response too large")
+	}
+	c.debugf("backend request method=%s status=%d", method, resp.StatusCode)
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return nil, classifyAuthError(resp.StatusCode, respBody)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, truncate(respBody, 200))
+		return nil, fmt.Errorf("request failed with status %d", resp.StatusCode)
 	}
 	return respBody, nil
 }
@@ -863,19 +974,21 @@ func (c *Client) fetchJSON(ctx context.Context, method, url string, payload any)
 	if err := c.evaluate(ctx, script, &resp); err != nil {
 		return browserResponse{}, err
 	}
-	c.debugf("browser fetch method=%s url=%s status=%d body=%s", method, url, resp.Status, truncate([]byte(resp.Text), 300))
+	c.debugf("browser fetch method=%s status=%d", method, resp.Status)
 	return resp, nil
 }
 
 func (c *Client) evaluate(ctx context.Context, expression string, out any) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			c.debugf("evaluate panic recovered: %v", r)
+			c.debugf("evaluate panic recovered")
 			err = fmt.Errorf("chrome evaluation panic: %v", r)
 		}
 	}()
 
-	return chromedp.Run(c.browserCtx, chromedp.ActionFunc(func(runCtx context.Context) error {
+	browserCtx, cancel := c.browserCommandContext(ctx)
+	defer cancel()
+	return chromedp.Run(browserCtx, chromedp.ActionFunc(func(runCtx context.Context) error {
 		result, exception, err := runtime.Evaluate(expression).
 			WithAwaitPromise(true).
 			WithReturnByValue(true).
@@ -903,7 +1016,7 @@ func decodeResponse(resp browserResponse, out any) error {
 		if resp.Status == 401 || resp.Status == 403 {
 			return classifyAuthError(resp.Status, []byte(resp.Text))
 		}
-		return fmt.Errorf("request failed with status %d: %s", resp.Status, truncate([]byte(resp.Text), 200))
+		return fmt.Errorf("request failed with status %d", resp.Status)
 	}
 	if len(resp.Body) == 0 || string(resp.Body) == "null" {
 		return errors.New("response body was empty")
@@ -921,7 +1034,7 @@ func ensureSuccess(resp browserResponse, id string) error {
 	if resp.Status == 401 || resp.Status == 403 {
 		return classifyAuthError(resp.Status, []byte(resp.Text))
 	}
-	return fmt.Errorf("update conversation %s failed with status %d: %s", id, resp.Status, truncate([]byte(resp.Text), 200))
+	return fmt.Errorf("update conversation failed with status %d", resp.Status)
 }
 
 func resolveChromePath(override string) (string, error) {
@@ -992,6 +1105,8 @@ func (c *Client) closeBrowserSession() {
 		c.allocCancel()
 		c.allocCancel = nil
 	}
+	c.browserCtx = nil
+	c.allocCtx = nil
 }
 
 func (c *Client) reattachToLivePage() error {

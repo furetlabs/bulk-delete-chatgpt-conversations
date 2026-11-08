@@ -1,9 +1,11 @@
 package chatgpt
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/zalando/go-keyring"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,32 +49,29 @@ func ResolveAuthStatePath() (string, error) {
 	return filepath.Join(configDir, "chatgpt-bulk", "auth.json"), nil
 }
 
+const keyringService = "chatgpt-cleaner"
+
+func keyringAccount(path string) string { return fmt.Sprintf("%x", sha256.Sum256([]byte(path))) }
+
 func LoadAuthState() (AuthState, string, error) {
 	path, err := ResolveAuthStatePath()
 	if err != nil {
 		return AuthState{}, "", err
 	}
-
-	raw, err := os.ReadFile(path)
+	raw, err := keyring.Get(keyringService, keyringAccount(path))
+	if errors.Is(err, keyring.ErrNotFound) {
+		return AuthState{}, path, os.ErrNotExist
+	}
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return AuthState{}, path, os.ErrNotExist
-		}
-		return AuthState{}, path, fmt.Errorf("read auth state: %w", err)
+		return AuthState{}, path, fmt.Errorf("access secure credential store: %w", err)
 	}
-
 	var state AuthState
-	if err := json.Unmarshal(raw, &state); err != nil {
-		return AuthState{}, path, fmt.Errorf("decode auth state: %w", err)
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		return AuthState{}, path, fmt.Errorf("decode secure auth state: %w", err)
 	}
-	state.SessionToken = strings.TrimSpace(state.SessionToken)
-	state.CSRFToken = strings.TrimSpace(state.CSRFToken)
-	state.AccessToken = strings.TrimSpace(state.AccessToken)
-	state.UserEmail = strings.TrimSpace(state.UserEmail)
-	if state.SessionToken == "" {
+	if strings.TrimSpace(state.SessionToken) == "" {
 		return AuthState{}, path, errors.New("stored auth is missing a session token")
 	}
-
 	return state, path, nil
 }
 
@@ -81,31 +80,19 @@ func SaveAuthState(state AuthState) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
-	state.SessionToken = strings.TrimSpace(state.SessionToken)
-	state.CSRFToken = strings.TrimSpace(state.CSRFToken)
-	state.AccessToken = strings.TrimSpace(state.AccessToken)
-	state.UserEmail = strings.TrimSpace(state.UserEmail)
-	if state.SessionToken == "" {
+	if strings.TrimSpace(state.SessionToken) == "" {
 		return "", errors.New("cannot save auth state without a session token")
 	}
 	if state.SavedAt.IsZero() {
 		state.SavedAt = time.Now().UTC()
 	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return "", fmt.Errorf("create auth state dir: %w", err)
-	}
-
-	raw, err := json.MarshalIndent(state, "", "  ")
+	raw, err := json.Marshal(state)
 	if err != nil {
-		return "", fmt.Errorf("encode auth state: %w", err)
+		return "", err
 	}
-	raw = append(raw, '\n')
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return "", fmt.Errorf("write auth state: %w", err)
+	if err = keyring.Set(keyringService, keyringAccount(path), string(raw)); err != nil {
+		return "", fmt.Errorf("save secure auth state: %w", err)
 	}
-
 	return path, nil
 }
 
@@ -114,13 +101,44 @@ func RemoveAuthState() (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	if err := os.Remove(path); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return path, false, nil
-		}
-		return path, false, fmt.Errorf("remove auth state: %w", err)
+	err = keyring.Delete(keyringService, keyringAccount(path))
+	if errors.Is(err, keyring.ErrNotFound) {
+		return path, false, nil
+	}
+	if err != nil {
+		return path, false, fmt.Errorf("remove secure auth state: %w", err)
 	}
 	return path, true, nil
+}
+
+// MigrateLegacyAuthState imports but never deletes the old file. Call only on explicit user request.
+func MigrateLegacyAuthState() error {
+	path, err := ResolveAuthStatePath()
+	if err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("legacy auth is not a regular file")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var state AuthState
+	if err = json.Unmarshal(raw, &state); err != nil {
+		return err
+	}
+	if _, _, err = LoadAuthState(); err == nil {
+		return errors.New("secure auth already exists")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, err = SaveAuthState(state)
+	return err
 }
 
 func ResolveAuth() (ResolvedAuth, error) {
@@ -143,8 +161,5 @@ func MaskToken(token string) string {
 	if token == "" {
 		return "Unavailable"
 	}
-	if len(token) <= 16 {
-		return token
-	}
-	return token[:8] + "..." + token[len(token)-6:]
+	return "[redacted]"
 }

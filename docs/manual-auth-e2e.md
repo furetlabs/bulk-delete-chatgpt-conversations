@@ -1,3 +1,5 @@
+> **Documentation historique de l’amont :** le stockage dans un fichier et le harness décrits ci-dessous ne correspondent plus à cette branche. Voir [DEVELOPPEMENT.md](DEVELOPPEMENT.md) avant toute utilisation. Les actions réelles sont désactivées.
+
 # Manual-Assisted Auth E2E Harness
 
 This repo includes a Go-based helper for repeatable live auth checks on different machines:

@@ -123,6 +123,7 @@ type Model struct {
 	selected      map[string]struct{}
 	actionCursor  int
 	runningIndex  int
+	batchCancel   context.CancelFunc
 	results       []actionResult
 	err           error
 	filterText    string
@@ -151,6 +152,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 	case loadResultMsg:
+		if m.phase == phaseRunning {
+			return m, nil
+		}
 		if msg.err != nil {
 			if msg.refresh && len(m.conversations) == 0 {
 				m.phase = phaseError
@@ -181,6 +185,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, pollSnapshotCmd(m.client)
 		}
 	case actionFinishedMsg:
+		if m.batchCancel != nil {
+			m.batchCancel()
+			m.batchCancel = nil
+		}
 		m.results = msg.results
 		m.reconcileActionResults(msg.results)
 		if len(m.conversations) == 0 {
@@ -191,10 +199,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyPressMsg:
 		switch m.phase {
-		case phaseLoading, phaseRunning:
+		case phaseLoading:
 			if isQuitKey(msg) {
 				return m, tea.Quit
 			}
+		case phaseRunning:
+			if isQuitKey(msg) && m.batchCancel != nil {
+				m.batchCancel()
+				m.loadingText = "Cancelling..."
+			}
+
 		case phaseSelect:
 			return m.updateSelection(msg)
 		case phaseAction:
@@ -293,6 +307,7 @@ func (m Model) updateSelection(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case msg.Code == tea.KeyBackspace || msg.String() == "backspace":
 			if len(m.filterText) > 0 {
 				m.filterText = m.filterText[:len(m.filterText)-1]
+				m.selected = make(map[string]struct{})
 				m.applyFilterAndSort()
 				m.cursor = 0
 			}
@@ -300,6 +315,7 @@ func (m Model) updateSelection(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			r := msg.String()
 			if len(r) == 1 || r == " " {
 				m.filterText += r
+				m.selected = make(map[string]struct{})
 				m.applyFilterAndSort()
 				m.cursor = 0
 			}
@@ -333,10 +349,17 @@ func (m Model) updateSelection(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case isToggleKey(msg):
 		m.toggleCurrent()
 	case matchesRune(msg, "a"):
-		if len(m.selected) == len(m.filtered) {
-			m.selected = make(map[string]struct{})
-		} else {
-			for _, conv := range m.filtered {
+		allSelected := len(m.filtered) > 0
+		for _, conv := range m.filtered {
+			if _, ok := m.selected[conv.ID]; !ok {
+				allSelected = false
+				break
+			}
+		}
+		for _, conv := range m.filtered {
+			if allSelected {
+				delete(m.selected, conv.ID)
+			} else {
 				m.selected[conv.ID] = struct{}{}
 			}
 		}
@@ -380,7 +403,9 @@ func (m Model) updateConfirmation(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.phase = phaseAction
 	case matchesRune(msg, "y") || isConfirmKey(msg):
 		m.phase = phaseRunning
-		return m, runBulkActionCmd(m.client, m.selectedConversations(), m.selectedAction())
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		m.batchCancel = cancel
+		return m, runBulkActionCmd(ctx, m.client, m.selectedConversations(), m.selectedAction())
 	}
 	return m, nil
 }
@@ -924,27 +949,30 @@ func pollSnapshotCmd(client *chatgpt.Client) tea.Cmd {
 	})
 }
 
-func runBulkActionCmd(client *chatgpt.Client, conversations []chatgpt.Conversation, action actionChoice) tea.Cmd {
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
+func runBatch(ctx context.Context, conversations []chatgpt.Conversation, apply func(context.Context, string) error) []actionResult {
+	results := make([]actionResult, 0, len(conversations))
+	for _, conv := range conversations {
+		if ctx.Err() != nil {
+			break
+		}
+		err := apply(ctx, conv.ID)
+		results = append(results, actionResult{id: conv.ID, label: titleFor(conv), err: err})
+	}
+	return results
+}
 
-		results := make([]actionResult, 0, len(conversations))
-		// Apply mutations serially so status and rate-limiting behavior remain predictable.
-		for _, conv := range conversations {
-			var err error
+func runBulkActionCmd(ctx context.Context, client *chatgpt.Client, conversations []chatgpt.Conversation, action actionChoice) tea.Cmd {
+	return func() tea.Msg {
+		results := runBatch(ctx, conversations, func(ctx context.Context, id string) error {
 			switch action {
 			case actionArchive:
-				err = client.ArchiveConversation(ctx, conv.ID)
+				return client.ArchiveConversation(ctx, id)
 			case actionDelete:
-				err = client.DeleteConversation(ctx, conv.ID)
+				return client.DeleteConversation(ctx, id)
+			default:
+				return fmt.Errorf("invalid action")
 			}
-			results = append(results, actionResult{
-				id:    conv.ID,
-				label: titleFor(conv),
-				err:   err,
-			})
-		}
+		})
 		return actionFinishedMsg{results: results}
 	}
 }

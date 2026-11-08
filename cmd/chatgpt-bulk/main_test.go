@@ -46,7 +46,7 @@ func TestNewAppClientPromptsForPermanentAuthWhenStoredAuthMissing(t *testing.T) 
 	}
 
 	output := stdout.String()
-	if !strings.Contains(output, "Stored ChatGPT auth file not found at /tmp/auth.json") {
+	if !strings.Contains(output, "Stored ChatGPT auth not found (profile /tmp/auth.json)") {
 		t.Fatalf("stdout = %q, want missing auth file notice", output)
 	}
 	if !strings.Contains(output, "Use `chatgpt-bulk login` for short-lived sessions.") {
@@ -105,7 +105,7 @@ func TestNewAppClientReturnsHelpfulErrorWhenPromptIsNotPossible(t *testing.T) {
 	if err == nil {
 		t.Fatal("newAppClient() error = nil, want missing auth error")
 	}
-	if !strings.Contains(err.Error(), "stored ChatGPT auth file is missing at /tmp/auth.json; run `chatgpt-bulk login` to authenticate") {
+	if !strings.Contains(err.Error(), "stored ChatGPT auth is missing (profile /tmp/auth.json); run `chatgpt-bulk login` to authenticate") {
 		t.Fatalf("error = %v, want missing auth guidance", err)
 	}
 }
@@ -151,7 +151,7 @@ func TestLoginCommandSavesPermanentAuthWhenUserChoosesYes(t *testing.T) {
 	if tuiRan {
 		t.Fatal("runTUIFn() called for permanent login, want false")
 	}
-	if !strings.Contains(stdout.String(), "Saved auth to /tmp/auth.json") {
+	if !strings.Contains(stdout.String(), "Saved auth in the system credential store (profile /tmp/auth.json)") {
 		t.Fatalf("stdout = %q, want saved auth message", stdout.String())
 	}
 }

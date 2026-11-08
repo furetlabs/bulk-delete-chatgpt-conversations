@@ -1,3 +1,9 @@
+# ChatGPT Cleaner — version de développement
+
+> **État : prototype en simulation.** Les mutations réelles sont désactivées dans le client et dans l’interface graphique. La connexion et la récupération des conversations réelles n’ont pas été validées. Ne pas utiliser cette version pour effacer ou archiver des données réelles.
+>
+> Le texte historique ci-dessous décrit le projet amont et contient des instructions et promesses qui ne reflètent pas cette version. La référence pour cette branche est [docs/DEVELOPPEMENT.md](docs/DEVELOPPEMENT.md), notamment pour le Trousseau, la migration, les tests et la compilation macOS.
+
 <!-- ![Logo](./assets/transparent-background.png) -->
 <p align="center">
     <img src="./assets/transparent-background.png" alt="logo" height="200" />

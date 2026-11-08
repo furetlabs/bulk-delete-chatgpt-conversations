@@ -97,6 +97,15 @@ func newRootCmd() *cobra.Command {
 	rootCmd.AddCommand(newLoginCmd(opts))
 	rootCmd.AddCommand(newLogoutCmd())
 	rootCmd.AddCommand(newAuthCmd())
+	protectionCmd := &cobra.Command{Use: "protections", Short: "Manage local conversation protections"}
+	protectionCmd.AddCommand(&cobra.Command{Use: "import-legacy", Short: "Trust and import an existing unmarked protection file", RunE: func(cmd *cobra.Command, args []string) error {
+		if err := chatgpt.ImportLegacyProtections(); err != nil {
+			return err
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), "Existing protections imported without modifying the list.")
+		return nil
+	}})
+	rootCmd.AddCommand(protectionCmd)
 
 	return rootCmd
 }
@@ -179,12 +188,12 @@ func newLoginCmd(opts *commandOptions) *cobra.Command {
 				return err
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "Logged in as %s\nSaved auth to %s\n", displayValue(state.UserEmail, "unknown email"), path)
+			fmt.Fprintf(cmd.OutOrStdout(), "Logged in as %s\nSaved auth in the system credential store (profile %s)\n", displayValue(state.UserEmail, "unknown email"), path)
 			return nil
 		},
 	}
 
-	cmd.Flags().BoolVar(&loginOpts.permanent, "permanent", false, "Save auth to the default auth file")
+	cmd.Flags().BoolVar(&loginOpts.permanent, "permanent", false, "Save auth in the system credential store")
 	cmd.Flags().BoolVar(&loginOpts.sessionOnly, "session-only", false, "Keep auth in-memory only and open the TUI for this session")
 	return cmd
 }
@@ -195,6 +204,13 @@ func newAuthCmd() *cobra.Command {
 		Short: "Inspect stored ChatGPT authentication state",
 	}
 	authCmd.AddCommand(newAuthStatusCmd())
+	authCmd.AddCommand(&cobra.Command{Use: "migrate-legacy", Short: "Import legacy auth into the system credential store", RunE: func(cmd *cobra.Command, args []string) error {
+		if err := chatgpt.MigrateLegacyAuthState(); err != nil {
+			return err
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), "Imported credentials into the system credential store. The old file remains; remove it manually after verifying the import.")
+		return nil
+	}})
 	return authCmd
 }
 
@@ -211,17 +227,17 @@ func newAuthStatusCmd() *cobra.Command {
 			state, _, loadErr := chatgpt.LoadAuthState()
 			hasStored := loadErr == nil
 			if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
-				return fmt.Errorf("auth file read failed: %w", loadErr)
+				return fmt.Errorf("credential store read failed: %w", loadErr)
 			}
 
 			if hasStored {
 				fmt.Fprintf(cmd.OutOrStdout(), "Stored auth: present\n")
-				fmt.Fprintf(cmd.OutOrStdout(), "Auth file: %s\n", path)
+				fmt.Fprintf(cmd.OutOrStdout(), "Auth profile: %s\n", path)
 				fmt.Fprintf(cmd.OutOrStdout(), "Stored email: %s\n", displayValue(state.UserEmail, "unknown"))
 				fmt.Fprintf(cmd.OutOrStdout(), "Last refreshed: %s\n", state.SavedAt.Format(time.RFC3339))
 			} else {
 				fmt.Fprintf(cmd.OutOrStdout(), "Stored auth: absent\n")
-				fmt.Fprintf(cmd.OutOrStdout(), "Auth file: %s\n", path)
+				fmt.Fprintf(cmd.OutOrStdout(), "Auth profile: %s\n", path)
 			}
 			return nil
 		},
@@ -251,7 +267,7 @@ func newLogoutCmd() *cobra.Command {
 func newAppClient(cmd *cobra.Command, opts *commandOptions) (*chatgpt.Client, error) {
 	resolved, err := resolveAuthFn()
 	if err != nil {
-		return nil, fmt.Errorf("auth file read failed: %w", err)
+		return nil, fmt.Errorf("credential store read failed: %w", err)
 	}
 	if resolved.Source == chatgpt.AuthSourceNone {
 		return newInteractiveLoginClient(cmd, opts, resolved.Path)
@@ -304,11 +320,11 @@ func resolveLoginMode(cmd *cobra.Command, opts *loginOptions) (loginMode, error)
 
 func newInteractiveLoginClient(cmd *cobra.Command, opts *commandOptions, authPath string) (*chatgpt.Client, error) {
 	out := cmd.OutOrStdout()
-	fmt.Fprintf(out, "Stored ChatGPT auth file not found at %s\n", authPath)
+	fmt.Fprintf(out, "Stored ChatGPT auth not found (profile %s)\n", authPath)
 	fmt.Fprintln(out, "Use `chatgpt-bulk login` for short-lived sessions.")
 
 	if !isTerminalFn(cmd.InOrStdin(), out) {
-		return nil, fmt.Errorf("stored ChatGPT auth file is missing at %s; run `chatgpt-bulk login` to authenticate", authPath)
+		return nil, fmt.Errorf("stored ChatGPT auth is missing (profile %s); run `chatgpt-bulk login` to authenticate", authPath)
 	}
 
 	saveAuth, err := promptToSaveAuth(cmd, authPath)
@@ -335,7 +351,7 @@ func newInteractiveLoginClient(cmd *cobra.Command, opts *commandOptions, authPat
 func promptToSaveAuth(cmd *cobra.Command, authPath string) (bool, error) {
 	reader := bufio.NewReader(cmd.InOrStdin())
 	for {
-		fmt.Fprintf(cmd.OutOrStdout(), "Create a permanent auth file at %s? [y/N]: ", authPath)
+		fmt.Fprintf(cmd.OutOrStdout(), "Save permanent auth in the system credential store (profile %s)? [y/N]: ", authPath)
 
 		answer, err := reader.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {

@@ -12,7 +12,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Validate install script syntax
-        run: sh -n scripts/install-via-bin.sh
+        run: |
+          sh -n scripts/install-via-bin.sh
+          sh -n scripts/package-macos.sh
 
       - uses: actions/setup-go@v5
         with:
@@ -20,7 +22,7 @@ jobs:
           cache: true
 
       - name: Vet
-        run: go vet ./...
+        run: go vet -tags ci ./...
 
       - name: Test
-        run: go test ./...
+        run: go test -race -tags ci ./...

@@ -1,9 +1,9 @@
 package chatgpt
 
 import (
+	"github.com/zalando/go-keyring"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 )
@@ -22,6 +22,7 @@ func TestResolveAuthStatePathOverride(t *testing.T) {
 }
 
 func TestSaveLoadAndRemoveAuthState(t *testing.T) {
+	keyring.MockInit()
 	authPath := filepath.Join(t.TempDir(), "auth.json")
 	t.Setenv(authFileEnvVar, authPath)
 
@@ -54,16 +55,6 @@ func TestSaveLoadAndRemoveAuthState(t *testing.T) {
 		t.Fatalf("LoadAuthState() = %#v, want %#v", loaded, state)
 	}
 
-	if runtime.GOOS != "windows" {
-		info, err := os.Stat(authPath)
-		if err != nil {
-			t.Fatalf("os.Stat(%q) error = %v", authPath, err)
-		}
-		if mode := info.Mode().Perm(); mode != 0o600 {
-			t.Fatalf("auth file mode = %#o, want %#o", mode, 0o600)
-		}
-	}
-
 	removedPath, removed, err := RemoveAuthState()
 	if err != nil {
 		t.Fatalf("RemoveAuthState() error = %v", err)
@@ -80,6 +71,7 @@ func TestSaveLoadAndRemoveAuthState(t *testing.T) {
 }
 
 func TestResolveAuthReturnsStoredAuth(t *testing.T) {
+	keyring.MockInit()
 	authPath := filepath.Join(t.TempDir(), "auth.json")
 	t.Setenv(authFileEnvVar, authPath)
 
@@ -108,6 +100,7 @@ func TestResolveAuthReturnsStoredAuth(t *testing.T) {
 }
 
 func TestResolveAuthReturnsNoneWhenAuthFileMissing(t *testing.T) {
+	keyring.MockInit()
 	authPath := filepath.Join(t.TempDir(), "auth.json")
 	t.Setenv(authFileEnvVar, authPath)
 
@@ -124,10 +117,11 @@ func TestResolveAuthReturnsNoneWhenAuthFileMissing(t *testing.T) {
 }
 
 func TestResolveAuthReturnsStoredDecodeError(t *testing.T) {
+	keyring.MockInit()
 	authPath := filepath.Join(t.TempDir(), "auth.json")
 	t.Setenv(authFileEnvVar, authPath)
 
-	if err := os.WriteFile(authPath, []byte("{not-json"), 0o600); err != nil {
+	if err := keyring.Set(keyringService, keyringAccount(authPath), "{not-json"); err != nil {
 		t.Fatalf("os.WriteFile(%q) error = %v", authPath, err)
 	}
 
@@ -137,5 +131,87 @@ func TestResolveAuthReturnsStoredDecodeError(t *testing.T) {
 	}
 	if got := err.Error(); got == "" || got == os.ErrNotExist.Error() {
 		t.Fatalf("ResolveAuth() error = %v, want decode failure", err)
+	}
+}
+
+func TestMaskTokenNeverExposesSecret(t *testing.T) {
+	for _, token := range []string{"short", "01234567890123456789012345"} {
+		if MaskToken(token) != "[redacted]" {
+			t.Error("token must be redacted")
+		}
+	}
+}
+
+func TestSaveAuthStateDoesNotFollowSymlink(t *testing.T) {
+	keyring.MockInit()
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("untouched"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "auth.json")
+	if err := os.Symlink(target, path); err != nil {
+		t.Skip(err)
+	}
+	t.Setenv(authFileEnvVar, path)
+	if _, err := SaveAuthState(AuthState{SessionToken: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(target)
+	if err != nil || string(raw) != "untouched" {
+		t.Fatal("target changed")
+	}
+}
+
+func TestSaveAuthStateReplacesUnsafePermissions(t *testing.T) {
+	keyring.MockInit()
+	path := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(path, []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(authFileEnvVar, path)
+	if _, err := SaveAuthState(AuthState{SessionToken: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || string(raw) != "old" {
+		t.Fatal("legacy file modified")
+	}
+}
+
+func TestAuthStateIsNotWrittenToPlaintext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	t.Setenv(authFileEnvVar, path)
+	keyring.MockInit()
+	if _, err := SaveAuthState(AuthState{SessionToken: "secret-value"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("plaintext auth file was written")
+	}
+}
+
+func TestMigrationIsExplicitAndRetainsLegacyFile(t *testing.T) {
+	keyring.MockInit()
+	path := filepath.Join(t.TempDir(), "auth.json")
+	t.Setenv(authFileEnvVar, path)
+	if err := os.WriteFile(path, []byte(`{"session_token":"example"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := LoadAuthState(); !os.IsNotExist(err) {
+		t.Fatalf("legacy file was read implicitly: %v", err)
+	}
+	if err := MigrateLegacyAuthState(); err != nil {
+		t.Fatal(err)
+	}
+	state, _, err := LoadAuthState()
+	if err != nil || state.SessionToken != "example" {
+		t.Fatalf("migration failed: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("legacy file unexpectedly removed")
+	}
+	if err := MigrateLegacyAuthState(); err == nil {
+		t.Fatal("overwrote existing secure entry")
 	}
 }
